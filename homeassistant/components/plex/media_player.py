@@ -277,7 +277,7 @@ def request_configuration(host, hass, config, add_entities_callback):
         fields=[
             {"id": "token", "name": "X-Plex-Token", "type": ""},
             {"id": "has_ssl", "name": "Use SSL", "type": ""},
-            {"id": "do_not_verify_ssl", "name": "Do not verify SSL", "type": ""},
+            {"id": "do_not_verify", "name": "Do not verify SSL", "type": ""},
         ],
     )
 
