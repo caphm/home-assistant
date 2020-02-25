@@ -41,6 +41,7 @@ SUPPORTED_PLATFORMS = [
     "binary_sensor",
     "sensor",
     "scene",
+    "media_player",
 ]
 
 IGNORED_CAPABILITIES = [
