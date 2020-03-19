@@ -20,6 +20,63 @@ SUPPORTED_FEATURES = (
     SUPPORT_VOLUME_SET | SUPPORT_VOLUME_STEP
 )
 
+KNOWN_APPS = {
+    "Dailymotion": ["Ahw07WXIjx.Dailymotion"],
+    "Tune In": ["tisT7SVUug.tunein"],
+    "Deezer": ["cexr1qp97S.Deezer"],
+    "OkiDoki": ["xqqJ00GGlC.okidoki"],
+    "Facebook": ["11091000000", "4ovn894vo9.Facebook"],
+    "Wuaki TV": ["vbUQClczfR.Wuakitv"],
+    "Play Movies": ["3201601007250", "QizQxC7CUf.PlayMovies"],
+    "Kick": ["QBA3qXl8rv.Kick"],
+    "Arte": ["DJ8grEH6Hu.arte"],
+    "Vimeo": ["JtPoChZbf4.Vimeo"],
+    "GameFly Streaming": ["hIWwRyZjcD.GameFlyStreaming"],
+    "No Lim": ["sHi2hDJGmf.nolim"],
+    "Canal+": ["guMmq95nKK.CanalPlusLauncher"],
+    "Netflix": ["11101200001", "RN1MCdNq8t.Netflix", "org.tizen.netflix-app"],
+    "Amazon Prime Video": ["3201512006785", "evKhCgZelL.AmazonIgnitionLauncher2", "org.tizen.ignition"],
+    "Youtube": ["111299001912", "9Ur5IzDKqV.TizenYouTube"],
+    "HBO Go": ["3201706012478", "gDhibXvFya.HBOGO"],
+    "Eleven Sports": ["3201702011871", "EmCpcvhukH.ElevenSports"],
+    "Filmbox Live": ["141299000100", "ASUvdWVqRb.FilmBoxLive"],
+    "Spotify": ["3201606009684", "rJeHak5zRg.Spotify"],
+    "AccuWeather": ["ABor2M9vjb.acc"],
+    "My5": ["EkzyZtmneG.My5"],
+    "Denn Express": ["yFo6bAK50v.Dennexpres"],
+    "Europa 2": ["gdEZI5lLXr.Europa2FHD"],
+    "TV SME": ["bm9PqdAwjv.TvSme"],
+    "IDNES": ["dH3Ztod7bU.IDNES"],
+    "Onet VOD": ["3201607009918", "wsFJCxteqc.OnetVodEden"],
+    "TubaFM": ["rZyaXW5csM.TubaFM"],
+    "Curzon": ["4bjaTLNMia.curzon"],
+    "OCS": ["RVvpJ8SIU6.ocs"],
+    "Molotov": ["bstjKvX6LM.molotov"],
+    "SFR Sport": ["RffagId0eC.SfrSport"],
+    "Extra Tweet": ["phm0eEdRZ4.ExtraTweetIM2"],
+    "Vevo": ["VAarU8iUtx.samsungTizen"],
+    "SmartIPTV": ["g0ScrkpO1l.SmartIPTV"],
+    "Plex": ["3201512006963", "kIciSQlYEM.plex"],
+    "Internet": ["org.tizen.browser"],
+    "Chili": ["3201505002690"],
+    "ipla": ["3201507004202"],
+    "Player.pl": ["3201508004642"],
+    "DS video": ["111399002250"],
+    "Smart Pack": ["3201704012124"],
+    "e-Manual": ["20172100006"],
+    "Eurosport Player": ["3201703012079"],
+    "McAfee Security for TV": ["3201612011418"],
+}
+
+def create_app_identifiers_dict(known_apps):
+    app_identifiers = {}
+    for app_name, identifiers in known_apps.items():
+        for identifier in identifiers:
+            app_identifiers[identifier] = app_name
+    return app_identifiers
+
+APP_IDENTIFIERS = create_app_identifiers_dict(KNOWN_APPS)
+
 
 async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
     """Platform uses config entry setup."""
@@ -124,20 +181,13 @@ class SmartThingsTV(SmartThingsEntity, MediaPlayerDevice):
     @property
     def app_id(self):
         """ID of the current running app."""
-        raw_name = self._device.status.attributes["tvChannelName"].value
-        if raw_name and "." in raw_name:
-            return raw_name
-        return None
+        app_id = self._device.status.attributes["tvChannelName"].value
+        return app_id if app_id in APP_IDENTIFIERS else None
 
     @property
     def app_name(self):
         """Name of the current running app."""
-        raw_name = self._device.status.attributes["tvChannelName"].value
-        if raw_name:
-            parts = raw_name.split(".")
-            if len(parts) > 1:
-                return parts[1]
-        return None
+        return APP_IDENTIFIERS.get(self._device.status.attributes["tvChannelName"].value)
 
     async def async_turn_off(self, **kwargs) -> None:
         """Turn the TV off."""
