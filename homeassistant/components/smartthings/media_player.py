@@ -91,7 +91,7 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
             SmartThingsTV(device)
             for device in broker.devices.values()
             if broker.any_assigned(device.device_id, "switch")
-                and device.device_type_name == "Samsung OCF TV"
+                and any("samsungtv" in capability for capability in device.capabilities)
         ]
     )
 
