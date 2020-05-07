@@ -68,18 +68,19 @@ class MemoryDataStore(object):
 class TizenWebsocket:
     """Represent a websocket connection to a Tizen TV."""
 
-    def __init__(
-        self, name, host, data_store=None, session=None, app_changed_callback=None
-    ):
+    def __init__(self, name, host, data_store=None, session=None, update_callback=None):
         """Initialize a TizenWebsocket instance."""
         self.host = host
         self.name = name
         self.active = False
         self.session = session or aiohttp.ClientSession()
         self.key_press_delay = 0
+        self.current_app = None
+        self.installed_apps = {}
         self._store = data_store or MemoryDataStore()
-        self._app_changed = app_changed_callback or _noop
-        self._current_task = None
+        self._update = update_callback or _noop
+        self._current_remote_task = None
+        self._current_control_task = None
         self._ws_remote = None
         self._ws_control = None
 
@@ -212,24 +213,25 @@ class TizenWebsocket:
         if msg.get("result"):
             app_id = msg.get("id")
             if app_id:
-                self._app_changed(
-                    (await self._store.get(ATTR_INSTALLED_APPS, {})).get(app_id)
-                )
+                self.current_app = self.installed_apps.get(app_id)
+                _LOGGER(f"Updated running app: {self.current_app}")
+                self._update()
 
         event = msg.get("event")
         if event == "ms.channel.connect":
             _LOGGER.debug("Control: Handshake complete, host has confirmed connection")
-            # await self.get_running_app()
+            await self.get_running_app()
 
     async def _handle_installed_apps(self, response):
-        _LOGGER.debug("Got list of installed apps")
         list_app = response.get("data", {}).get("data")
         installed_apps = {}
         for app_info in list_app:
             app_id = app_info["appId"]
             app = App(app_id, app_info["name"], app_info["app_type"])
             installed_apps[app_id] = app
-        await self._store.set(ATTR_INSTALLED_APPS, installed_apps)
+        self.installed_apps = installed_apps
+        _LOGGER.debug(f"Got list of installed apps: {self.installed_apps}")
+        self._update()
 
     async def request_installed_apps(self):
         _LOGGER.debug("Requesting list of installed apps")
@@ -242,6 +244,21 @@ class TizenWebsocket:
             )
         except Exception:
             _LOGGER.error("Failed to request installed apps", exc_info=True)
+
+    async def get_running_app(self, *, force_scan=False):
+        _LOGGER.debug("Polling currently running app")
+        for app in self.installed_apps.values():
+            await self._ws_control.send_json(
+                {
+                    "id": app.app_id,
+                    "method": (
+                        "ms.webapplication.get"
+                        if app.app_type == 4
+                        else "ms.application.get"
+                    ),
+                    "params": {"id": app.app_id},
+                }
+            )
 
     async def send_key(self, key, key_press_delay=None, cmd="Click"):
         _LOGGER.debug(f"Sending key {key}")
@@ -267,7 +284,7 @@ class TizenWebsocket:
 
     async def run_app(self, app_id, action_type="", meta_tag=""):
         if not action_type:
-            app = (await self._store.get(ATTR_INSTALLED_APPS, {})).get(app_id)
+            app = self.installed_apps.get(app_id)
             action_type = "DEEP_LINK" if app and app.app_type == 2 else "NATIVE_LAUNCH"
 
         _LOGGER.debug(

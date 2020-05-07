@@ -225,11 +225,12 @@ class SmartThingsTV(SmartThingsEntity, MediaPlayerDevice):
             self._upnp = upnp(
                 self._host, self.hass.helpers.aiohttp_client.async_get_clientsession()
             )
+
             self._tizenws = TizenWebsocket(
                 name=f"{WS_PREFIX} {self.name}",
                 host=self._host,
                 data_store=PersistentDataStore(self.hass, self.unique_id),
-                app_changed_callback=self._app_changed,
+                update_callback=self.async_schedule_update_ha_state,
             )
         self.async_schedule_update_ha_state(True)
 
@@ -249,15 +250,12 @@ class SmartThingsTV(SmartThingsEntity, MediaPlayerDevice):
             if self._tizenws:
                 if not self._tizenws.active:
                     self._tizenws.open(self.hass.loop)
-            else:
-                st_app_id = self._device.status.attributes["tvChannelName"].value
-                self._app_id = st_app_id if st_app_id in APP_IDENTIFIERS else None
-                self._app_name = APP_IDENTIFIERS.get(
-                    self._device.status.attributes["tvChannelName"].value
-                )
+                await self._tizenws.get_running_app()
             if self._upnp:
                 await self._update_volume_info()
         else:
+            self._app_id = None
+            self._app_name = None
             if self._tizenws and self._tizenws.active:
                 self._tizenws.close()
 
@@ -309,12 +307,24 @@ class SmartThingsTV(SmartThingsEntity, MediaPlayerDevice):
     @property
     def source_list(self):
         """List of available input sources."""
-        return self._device.status.attributes[Attribute.supported_input_sources].value
+        installed_apps = (
+            [app.app_name for app in self._tizenws.installed_apps.values()]
+            if self._tizenws
+            else []
+        )
+        return (
+            self._device.status.attributes[Attribute.supported_input_sources].value
+            + installed_apps
+        )
 
     @property
     def source(self):
         """Name of the current input source."""
-        return self._device.status.attributes[Attribute.input_source].value
+        return (
+            self.app_name
+            if self.app_name
+            else self._device.status.attributes[Attribute.input_source].value
+        )
 
     # @property
     # def media_title(self):
@@ -340,17 +350,21 @@ class SmartThingsTV(SmartThingsEntity, MediaPlayerDevice):
     @property
     def app_id(self):
         """ID of the current running app."""
-        return self._app_id
+        if self._tizenws:
+            return self._tizenws.current_app.app_id if self._tizenws.current_app else None
+        else:
+            st_app_id = self._device.status.attributes["tvChannelName"].value
+            self._app_id = st_app_id if st_app_id in APP_IDENTIFIERS else None
 
     @property
     def app_name(self):
         """Name of the current running app."""
-        return self._app_name
-
-    def _app_changed(self, app):
-        self._app_name = app.app_name
-        self._app_id = app.app_id
-        self.async_schedule_update_ha_state()
+        if self._tizenws:
+            return self._tizenws.current_app.app_name if self._tizenws.current_app else None
+        else:
+            return APP_IDENTIFIERS.get(
+                self._device.status.attributes["tvChannelName"].value
+            )
 
     async def async_turn_off(self, **kwargs) -> None:
         """Turn the TV off."""
@@ -410,9 +424,13 @@ class SmartThingsTV(SmartThingsEntity, MediaPlayerDevice):
 
     async def async_select_source(self, source):
         """Select input source."""
-        await self._device.command(
-            "main", Capability.media_input_source, "setInputSource", [source]
-        )
+        for app in self.installed_apps:
+            if app.app_name == source:
+                await self._tizenws.run_app(app.app_id)
+        else:
+            await self._device.command(
+                "main", Capability.media_input_source, "setInputSource", [source]
+            )
         self.async_schedule_update_ha_state(True)
 
     async def _try_send_key(self, key, capability, command, component="main"):
