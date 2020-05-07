@@ -3,11 +3,7 @@ import logging
 import os
 from typing import Optional, Sequence
 
-from datetime import timedelta, datetime
-from async_timeout import timeout
-
 from pysmartthings import Attribute, Capability
-from pysmartthings.capability import ATTRIBUTE_ON_VALUES
 
 from homeassistant.components.media_player import MediaPlayerDevice
 from homeassistant.components.media_player.const import (
@@ -38,12 +34,15 @@ from homeassistant.const import (
 )
 
 from . import SmartThingsEntity
-from .const import DATA_BROKERS, DOMAIN
-from .tvapi.samsungws import SamsungTVWS
+from .const import DATA_BROKERS, DOMAIN, STORAGE_VERSION
 from .tvapi.upnp import upnp
-from .tvapi.tizenws import TizenWebsocket
+from .tvapi.tizenws import TizenWebsocket, MemoryDataStore
 
+import voluptuous as vol
 from homeassistant.util import slugify
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.json import JSONEncoder
+from homeassistant.helpers.storage import Store
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -169,6 +168,30 @@ def get_capabilities(capabilities: Sequence[str]) -> Optional[Sequence[str]]:
         return supported
 
 
+class PersistentDataStore(MemoryDataStore):
+    def __init__(self, hass, id):
+        super().__init__()
+        self.hass = hass
+        self.id = id
+
+    async def _load_from_store(self):
+        """Load the retained data from store and return de-serialized data."""
+        store = Store(
+            self.hass, STORAGE_VERSION, f"smartthings.{self.id}", encoder=JSONEncoder
+        )
+        restored = await store.async_load()
+        if restored is None:
+            return {}
+        return restored
+
+    async def _save_to_store(self, data):
+        """Generate dynamic data to store and save it to the filesystem."""
+        store = Store(
+            self.hass, STORAGE_VERSION, f"smartthings.{self.id}", encoder=JSONEncoder
+        )
+        await store.async_save(data)
+
+
 class SmartThingsTV(SmartThingsEntity, MediaPlayerDevice):
     """Define a SmartThings TV."""
 
@@ -177,33 +200,10 @@ class SmartThingsTV(SmartThingsEntity, MediaPlayerDevice):
         self._host = None
         self._tizenws = None
         self._upnp = None
-        self._token_file = None
         self._volume = None
         self._muted = None
-        self._app_list = None
-        self._last_command_time = None
-
-    def _gen_token_file(self):
-        self._token_file = self.hass.config.path(f"/tizen-{self.unique_id}.txt")
-
-        if os.path.isfile(self._token_file) is False:
-            try:
-                open(self._token_file, "w+").close()
-            except:
-                _LOGGER.error(f"Error creating token file: {self._token_file}")
-
-    # def _delete_token_file(self):
-
-    #     if not self._token_file:
-    #         return
-
-    #     if os.path.isfile(self._token_file) is True:
-
-    #         # delete token file for catch possible errors
-    #         try:
-    #             os.remove(self._token_file)
-    #         except:
-    #             _LOGGER.error(f"Error deleting token file: {self._token_file}")
+        self._app_name = None
+        self._app_id = None
 
     def _get_ip_addr(self):
         ipaddr = self.hass.states.get(
@@ -222,12 +222,14 @@ class SmartThingsTV(SmartThingsEntity, MediaPlayerDevice):
         await super().async_added_to_hass()
 
         if self._get_ip_addr():
-            self._gen_token_file()
-            self._upnp = upnp(self._host, self.hass.helpers.aiohttp_client.async_get_clientsession())
+            self._upnp = upnp(
+                self._host, self.hass.helpers.aiohttp_client.async_get_clientsession()
+            )
             self._tizenws = TizenWebsocket(
                 name=f"{WS_PREFIX} {self.name}",
                 host=self._host,
-                token_file=self._token_file,
+                data_store=PersistentDataStore(self.hass, self.unique_id),
+                app_changed_callback=self._app_changed,
             )
         self.async_schedule_update_ha_state(True)
 
@@ -244,8 +246,15 @@ class SmartThingsTV(SmartThingsEntity, MediaPlayerDevice):
         """Retrieve latest state."""
         await self._device.status.refresh()
         if self.state != STATE_OFF:
-            if self._tizenws and not self._tizenws.active:
-                self.hass.loop.create_task(self._tizenws.open())
+            if self._tizenws:
+                if not self._tizenws.active:
+                    self._tizenws.open(self.hass.loop)
+            else:
+                st_app_id = self._device.status.attributes["tvChannelName"].value
+                self._app_id = st_app_id if st_app_id in APP_IDENTIFIERS else None
+                self._app_name = APP_IDENTIFIERS.get(
+                    self._device.status.attributes["tvChannelName"].value
+                )
             if self._upnp:
                 await self._update_volume_info()
         else:
@@ -331,15 +340,17 @@ class SmartThingsTV(SmartThingsEntity, MediaPlayerDevice):
     @property
     def app_id(self):
         """ID of the current running app."""
-        app_id = self._device.status.attributes["tvChannelName"].value
-        return app_id if app_id in APP_IDENTIFIERS else None
+        return self._app_id
 
     @property
     def app_name(self):
         """Name of the current running app."""
-        return APP_IDENTIFIERS.get(
-            self._device.status.attributes["tvChannelName"].value
-        )
+        return self._app_name
+
+    def _app_changed(self, app):
+        self._app_name = app.app_name
+        self._app_id = app.app_id
+        self.async_schedule_update_ha_state()
 
     async def async_turn_off(self, **kwargs) -> None:
         """Turn the TV off."""
@@ -409,61 +420,47 @@ class SmartThingsTV(SmartThingsEntity, MediaPlayerDevice):
         try:
             await self._tizenws.send_key(key)
         except Exception:
-            _LOGGER.debug("Failed to send key via local remote, falling back to SmartThings")
+            _LOGGER.debug(
+                "Failed to send key via local remote, falling back to SmartThings"
+            )
             await self._device.command(component, capability, command)
         self.async_schedule_update_ha_state(True)
 
     async def async_play_media(self, media_type, media_id, **kwargs):
-        """Support changing a channel."""
+        if media_type == MEDIA_TYPE_CHANNEL:
+            try:
+                cv.positive_int(media_id)
+            except vol.Invalid:
+                _LOGGER.error("Media ID must be positive integer")
+                return
 
-        # Type channel
-        # if media_type == MEDIA_TYPE_CHANNEL:
-        #     try:
-        #         cv.positive_int(media_id)
-        #     except vol.Invalid:
-        #         _LOGGER.error("Media ID must be positive integer")
-        #         return
+            for digit in media_id:
+                await self._tizenws.send_key("KEY_" + digit, KEYPRESS_DEFAULT_DELAY)
 
-        #     for digit in media_id:
-        #         await self.async_send_command("KEY_" + digit)
-        #         await asyncio.sleep(KEYPRESS_DEFAULT_DELAY)
-
-        #     await self.async_send_command("KEY_ENTER")
-
-        # Launch an app
+            await self._tizenws.send_ke("KEY_ENTER")
         if media_type == MEDIA_TYPE_APP:
             await self._tizenws.run_app(media_id)
-
-        # Send custom key
         elif media_type == MEDIA_TYPE_KEY:
-        #     try:
-        #         cv.string(media_id)
-        #     except vol.Invalid:
-        #         _LOGGER.error('Media ID must be a string (ex: "KEY_HOME"')
-        #         return
+            try:
+                cv.string(media_id)
+            except vol.Invalid:
+                _LOGGER.error('Media ID must be a string (ex: "KEY_HOME"')
+                return
 
-        #     source_key = media_id
-             await self._tizenws.send_key(media_id)
+            #     source_key = media_id
+            await self._tizenws.send_key(media_id)
+        elif media_type == MEDIA_TYPE_URL:
+            try:
+                cv.url(media_id)
+            except vol.Invalid:
+                _LOGGER.error('Media ID must be an url (ex: "http://"')
+                return
 
-        # Play media
-        # elif media_type == MEDIA_TYPE_URL:
-        #     try:
-        #         cv.url(media_id)
-        #     except vol.Invalid:
-        #         _LOGGER.error('Media ID must be an url (ex: "http://"')
-        #         return
-
-        #     await self._upnp.async_set_current_media(media_id)
-        #     self._playing = True
-
-        # Trying to make stream component work on TV
+            await self._upnp.async_set_current_media(media_id)
         elif media_type == "application/vnd.apple.mpegurl":
             await self._upnp.async_set_current_media(media_id)
-            self._playing = True
-
         elif media_type == MEDIA_TYPE_BROWSER:
             self._tizenws.open_browser(media_id)
-
         else:
             _LOGGER.error("Unsupported media type")
             return

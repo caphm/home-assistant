@@ -7,6 +7,9 @@ from collections import namedtuple
 
 _LOGGER = logging.getLogger(__name__)
 
+ATTR_TOKEN = "token"
+ATTR_INSTALLED_APPS = "installed_apps"
+
 WS_ENDPOINT_REMOTE_CONTROL = "/api/v2/channels/samsung.remote.control"
 WS_ENDPOINT_APP_CONTROL = "/api/v2"
 
@@ -20,12 +23,12 @@ def serialize_string(string):
     return base64.b64encode(string).decode("utf-8")
 
 
-def format_websocket_url(host, name, token):
+def format_websocket_url(host, path, name, token=None):
     url = URL.build(
         scheme="wss",
         host=host,
         port=8002,
-        path=WS_ENDPOINT_REMOTE_CONTROL,
+        path=path,
         query={"name": serialize_string(name)},
     )
 
@@ -34,207 +37,266 @@ def format_websocket_url(host, name, token):
     return str(url)
 
 
+def _noop(*args, **kwargs):
+    pass
+
+
+class MemoryDataStore(object):
+    def __init__(self):
+        self._data = {}
+
+    async def get(self, key, default=None):
+        return (await self.get_data()).get(key, default)
+
+    async def set(self, key, value):
+        await self.get_data()
+        self._data[key] = value
+        await self._save_to_store(self._data)
+
+    async def get_data(self):
+        if not self._data:
+            self._data = await self._load_from_store()
+        return self._data
+
+    async def _load_from_store(self):
+        return {}
+
+    async def _save_to_store(self, data):
+        pass
+
+
 class TizenWebsocket:
     """Represent a websocket connection to a Tizen TV."""
 
-    def __init__(self, name, host, token_file, session=None):
+    def __init__(
+        self, name, host, data_store=None, session=None, app_changed_callback=None
+    ):
         """Initialize a TizenWebsocket instance."""
+        self.host = host
+        self.name = name
         self.active = False
         self.session = session or aiohttp.ClientSession()
-        self.installed_apps = {}
         self.key_press_delay = 0
-        self._token_file = token_file
+        self._store = data_store or MemoryDataStore()
+        self._app_changed = app_changed_callback or _noop
         self._current_task = None
         self._ws_remote = None
         self._ws_control = None
-        self._token = None
-        self.url = format_websocket_url(host, name, self.token)
 
-    @property
-    def token(self):
-        if self._token is None:
-            try:
-                with open(self._token_file, "r") as token_file:
-                    self._token = token_file.readline()
-            except (TypeError, FileNotFoundError):
-                _LOGGER.error("Could not load token from file", exc_info=True)
-            else:
-                _LOGGER.debug(f"Loaded token from {self._token_file}")
-        else:
-            _LOGGER.debug("Got token from memory")
-        return self._token
-
-    @token.setter
-    def token(self, token):
-        _LOGGER.info(f"Storing new token {token}")
-        self._token = token
-        try:
-            with open(self._token_file, "w") as token_file:
-                token_file.write(self._token)
-        except FileNotFoundError:
-            _LOGGER.error("Could not save token to file", exc_info=True)
-        else:
-            _LOGGER.debug("Saved token to file")
-
-    async def open(self):
-        """Open a persistent websocket connection and act on events."""
-        _LOGGER.debug("Opening TizenWS connection")
+    def open(self, loop):
         self.active = True
-        failed_attempts = 0
+        loop.create_task(self._open_remote())
+        loop.create_task(self._open_control())
+
+    def close(self):
+        """Close the listening websocket."""
+        _LOGGER.debug("Closing websocket connections")
+        self.active = False
+        if self._current_remote_task is not None:
+            self._current_remote_task.cancel()
+        if self._current_control_task is not None:
+            self._current_control_task.cancel()
+
+    async def _open_remote(self):
+        """Open a persistent websocket connection and act on events."""
+        _LOGGER.debug("Opening remote connection")
+        url = format_websocket_url(
+            self.host,
+            WS_ENDPOINT_REMOTE_CONTROL,
+            self.name,
+            await self._store.get(ATTR_TOKEN),
+        )
+        self.remote_handshake_errors = 0
         while self.active:
-            if failed_attempts == 3:
+            if self.remote_handshake_errors == 3:
+                _LOGGER.error(
+                    f"Remote: Handshake failed {self.handshake_errors} times, giving up"
+                )
                 self.active = False
                 break
-
-            _LOGGER.debug(f"Attempting websocket connection ({failed_attempts}) to {self.url}")
+            _LOGGER.debug(f"Remote: Attempting connection to {url}")
             try:
                 async with self.session.ws_connect(
-                    self.url, heartbeat=15, ssl=False
+                    url, heartbeat=15, ssl=False
                 ) as ws_remote:
                     self._ws_remote = ws_remote
-                    self._current_task = asyncio.Task.current_task()
-                    _LOGGER.info(f"Websocket to {self.url} established")
+                    self._current_remote_task = asyncio.Task.current_task()
+                    failed_attempts = 0
+                    _LOGGER.info(f"Remote: Connection established")
 
                     async for msg in self._ws_remote:
-                        _LOGGER.debug(f"Received websocket message: {msg}")
-                        # if msg.type == aiohttp.WSMSgType.PING:
-                        #     await ws_remote.send_pong()
-                        # elif msg.type == aiohttp.WSMSgType.PONG:
-                        #     await ws_remote.send_ping()
+                        _LOGGER.debug(f"Remote: Received message: {msg}")
                         if msg.type == aiohttp.WSMsgType.TEXT:
-                            await self._on_message(msg.json())
-                        elif msg.type == aiohttp.WSMsgType.CLOSED:
+                            await self._on_message_remote(msg.json())
+                        elif msg.type in (
+                            aiohttp.WSMsgType.CLOSED,
+                            aiohttp.WSMsgType.CLOSE,
+                            aiohttp.WSMsgType.CLOSING,
+                        ):
                             _LOGGER.info(
-                                f"Websocket connection closed by server (Code {msg.data} - {msg.extra})"
+                                f"Remote: Connection closed by server (Code {msg.data} - {msg.extra})"
                             )
                             break
                         elif msg.type == aiohttp.WSMsgType.ERROR:
-                            raise aiohttp.client_exceptions.ClientResponseError(
-                                f"Received an error: {msg.data}"
-                            )
+                            self.remote_handshake_errors += 1
+                            _LOGGER.error(f"Remote: Received error {msg.data})")
+                            break
             except aiohttp.client_exceptions.ClientConnectorError as e:
-                retry_delay = min(2 ** (failed_attempts - 1) * 5, 300)
-                failed_attempts += 1
-                self._ws_remote = None
+                retry_delay = min(2 ** (failed_attempts - 1), 300)
                 _LOGGER.error(
-                    "Websocket connection refused, retrying in %ds: %s", retry_delay, e
-                )
-                await asyncio.sleep(retry_delay)
-            except aiohttp.client_exceptions.ClientResponseError as e:
-                retry_delay = min(2 ** (failed_attempts - 1) * 5, 300)
-                failed_attempts += 1
-                self._ws_remote = None
-                _LOGGER.error(
-                    "Websocket connection failed, retrying in %ds: %s", retry_delay, e
+                    "Remote: Connection refused, retrying in %ds: %s", retry_delay, e
                 )
                 await asyncio.sleep(retry_delay)
             else:
-                self._ws_remote = None
-                failed_attempts = 0
-                _LOGGER.debug("Websocket disconnected")
-        _LOGGER.debug("Websocket connection closed")
+                _LOGGER.debug("Remote: disconnected")
+            self._ws_remote = None
+        _LOGGER.debug("Remote: stopped")
 
-    async def _on_message(self, msg):
+    async def _on_message_remote(self, msg):
         """Determine if messages relate to an interesting player event."""
         event = msg.get("event")
-        if not event:
-            return
 
         if event == "ms.channel.connect":
-            _LOGGER.debug("Handshake complete, host has confirmed connection")
-            token = msg.get("data", {}).get("token")
+            _LOGGER.debug("Remote: Handshake complete, host has confirmed connection")
+            token = msg.get("data", {}).get(ATTR_TOKEN)
             if token:
-                self.token = token
-            await self._request_apps_list()
+                await self._store.set(ATTR_TOKEN, token)
+            self.remote_handshake_errors = 0
+            await self.request_installed_apps()
         elif event == "ed.installedApp.get":
-            self._handle_installed_app(msg)
+            await self._handle_installed_apps(msg)
         elif event == "ed.edenTV.update":
             # self.get_running_app(force_scan=True)
             pass
 
-    async def _request_apps_list(self):
-        _LOGGER.debug("Requesting list of installed apps")
-        await self._ws_remote.send_json(
-            {
-                "method": "ms.channel.emit",
-                "params": {"event": "ed.installedApp.get", "to": "host"},
-            }
-        )
+    async def _open_control(self):
+        """Open a persistent websocket connection and act on events."""
+        _LOGGER.debug("Opening control connection")
+        url = format_websocket_url(self.host, WS_ENDPOINT_APP_CONTROL, self.name)
+        while self.active:
+            _LOGGER.debug(f"Control: Attempting connection to {url}")
+            try:
+                async with self.session.ws_connect(
+                    url, heartbeat=15, ssl=False
+                ) as ws_control:
+                    self._ws_control = ws_control
+                    self._current_control_task = asyncio.Task.current_task()
+                    failed_attempts = 0
+                    _LOGGER.info(f"Control: Connection established")
 
-    def _handle_installed_app(self, response):
+                    async for msg in self._ws_control:
+                        _LOGGER.debug(f"Control: Received message: {msg}")
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            await self._on_message_control(msg.json())
+                        elif msg.type == aiohttp.WSMsgType.CLOSED:
+                            _LOGGER.info(
+                                f"Control: Connection closed by server (Code {msg.data} - {msg.extra})"
+                            )
+                            break
+                        elif msg.type == aiohttp.WSMsgType.ERROR:
+                            self.remote_handshake_errors += 1
+                            _LOGGER.error(f"Control: Received error {msg.data})")
+                            break
+            except aiohttp.client_exceptions.ClientConnectorError as e:
+                retry_delay = min(2 ** (failed_attempts - 1), 300)
+                _LOGGER.error(
+                    "Control: Connection refused, retrying in %ds: %s", retry_delay, e
+                )
+                await asyncio.sleep(retry_delay)
+            else:
+                _LOGGER.debug("Control: disconnected")
+            self._ws_control = None
+        _LOGGER.debug("Control: stopped")
+
+    async def _on_message_control(self, msg):
+        if msg.get("result"):
+            app_id = msg.get("id")
+            if app_id:
+                self._app_changed(
+                    (await self._store.get(ATTR_INSTALLED_APPS, {})).get(app_id)
+                )
+
+        event = msg.get("event")
+        if event == "ms.channel.connect":
+            _LOGGER.debug("Control: Handshake complete, host has confirmed connection")
+            # await self.get_running_app()
+
+    async def _handle_installed_apps(self, response):
         _LOGGER.debug("Got list of installed apps")
         list_app = response.get("data", {}).get("data")
         installed_apps = {}
         for app_info in list_app:
             app_id = app_info["appId"]
             app = App(app_id, app_info["name"], app_info["app_type"])
-            _LOGGER.debug("Found app: %s", app)
             installed_apps[app_id] = app
-        self.installed_apps = installed_apps
+        await self._store.set(ATTR_INSTALLED_APPS, installed_apps)
 
-    def close(self):
-        """Close the listening websocket."""
-        _LOGGER.debug("Closing websocket connection")
-        self.active = False
-        if self._current_task is not None:
-            self._current_task.cancel()
-
-    async def send_key(self, key, key_press_delay=None, cmd="Click"):
-        if not self._ws_remote:
-            _LOGGER.error("Cannot send key, not connected")
-            return
-
-        await self._ws_remote.send_json(
-            {
-                "method": "ms.remote.control",
-                "params": {
-                    "Cmd": cmd,
-                    "DataOfCmd": key,
-                    "Option": "false",
-                    "TypeOfRemote": "SendRemoteKey",
-                },
-            }
-        )
-
-        if key_press_delay is None:
-            await asyncio.sleep(self.key_press_delay)
-        elif key_press_delay > 0:
-            await asyncio.sleep(key_press_delay)
-
-    async def run_app(self, app_id, action_type="", meta_tag=""):
-        if not action_type:
-            app = self.installed_apps.get(app_id)
-            action_type = "DEEP_LINK" if app and app.app_type == 2 else "NATIVE_LAUNCH"
-
-        _LOGGER.debug(
-            "Sending run app app_id: %s app_type: %s meta_tag: %s",
-            app_id,
-            action_type,
-            meta_tag,
-        )
-
-        if self._ws_control and action_type == "DEEP_LINK":
-            await self._ws_control.send_json(
-                {
-                    "id": app_id,
-                    "method": "ms.application.start",
-                    "params": {"id": app_id},
-                }
-            )
-        elif self._ws_remote:
+    async def request_installed_apps(self):
+        _LOGGER.debug("Requesting list of installed apps")
+        try:
             await self._ws_remote.send_json(
                 {
                     "method": "ms.channel.emit",
+                    "params": {"event": "ed.installedApp.get", "to": "host"},
+                }
+            )
+        except Exception:
+            _LOGGER.error("Failed to request installed apps", exc_info=True)
+
+    async def send_key(self, key, key_press_delay=None, cmd="Click"):
+        _LOGGER.debug(f"Sending key {key}")
+        try:
+            await self._ws_remote.send_json(
+                {
+                    "method": "ms.remote.control",
                     "params": {
-                        "event": "ed.apps.launch",
-                        "to": "host",
-                        "data": {
-                            "action_type": action_type,
-                            "appId": app_id,
-                            "metaTag": meta_tag,
-                        },
+                        "Cmd": cmd,
+                        "DataOfCmd": key,
+                        "Option": "false",
+                        "TypeOfRemote": "SendRemoteKey",
                     },
                 }
             )
+        except:
+            _LOGGER.error(f"Failed to send key {key}", exc_info=True)
         else:
-            _LOGGER.error("Cannot send key, not connected")
+            if key_press_delay is None:
+                await asyncio.sleep(self.key_press_delay)
+            elif key_press_delay > 0:
+                await asyncio.sleep(key_press_delay)
+
+    async def run_app(self, app_id, action_type="", meta_tag=""):
+        if not action_type:
+            app = (await self._store.get(ATTR_INSTALLED_APPS, {})).get(app_id)
+            action_type = "DEEP_LINK" if app and app.app_type == 2 else "NATIVE_LAUNCH"
+
+        _LOGGER.debug(
+            f"Running app {app.app_name} ({app_id} / {action_type} / {meta_tag})"
+        )
+
+        try:
+            if action_type == "DEEP_LINK":
+                await self._ws_control.send_json(
+                    {
+                        "id": app_id,
+                        "method": "ms.application.start",
+                        "params": {"id": app_id},
+                    }
+                )
+            else:
+                await self._ws_remote.send_json(
+                    {
+                        "method": "ms.channel.emit",
+                        "params": {
+                            "event": "ed.apps.launch",
+                            "to": "host",
+                            "data": {
+                                "action_type": action_type,
+                                "appId": app_id,
+                                "metaTag": meta_tag,
+                            },
+                        },
+                    }
+                )
+        except Exception:
+            _LOGGER.error(f"Failed to run app {app_id}", exc_info=True)
