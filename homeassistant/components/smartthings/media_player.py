@@ -31,6 +31,7 @@ from homeassistant.const import (
     STATE_IDLE,
     STATE_PLAYING,
     STATE_PAUSED,
+    EVENT_HOMEASSISTANT_STOP,
 )
 
 from . import SmartThingsEntity
@@ -121,6 +122,8 @@ KNOWN_APPS = {
     "e-Manual": ["20172100006"],
     "Eurosport Player": ["3201703012079"],
     "McAfee Security for TV": ["3201612011418"],
+    "Zattoo": ["111299001432"],
+    "ARD Mediathek": ["3201412000679"],
 }
 
 
@@ -205,6 +208,12 @@ class SmartThingsTV(SmartThingsEntity, MediaPlayerDevice):
         self._app_name = None
         self._app_id = None
 
+        def close_tizenws():                                                
+            if self._tizenws and self._tizenws.active:                      
+                self._tizenws.close()
+
+        # self.hass.bus.async_listen(EVENT_HOMEASSISTANT_STOP, close_tizenws)
+
     def _get_ip_addr(self):
         ipaddr = self.hass.states.get(
             "input_text.{}_ipaddr".format(slugify(self.unique_id))
@@ -229,6 +238,7 @@ class SmartThingsTV(SmartThingsEntity, MediaPlayerDevice):
             self._tizenws = TizenWebsocket(
                 name=f"{WS_PREFIX} {self.name}",
                 host=self._host,
+                create_task=self.hass.async_create_task,
                 data_store=PersistentDataStore(self.hass, self.unique_id),
                 update_callback=self.async_schedule_update_ha_state,
             )
@@ -236,7 +246,8 @@ class SmartThingsTV(SmartThingsEntity, MediaPlayerDevice):
 
     async def async_will_remove_from_hass(self):
         await super().async_will_remove_from_hass()
-        self._tizenws.close()
+        if self._tizenws and self._tizenws.active:
+            self._tizenws.close()
 
     async def _update_volume_info(self):
         if self.state != STATE_OFF:
@@ -249,8 +260,7 @@ class SmartThingsTV(SmartThingsEntity, MediaPlayerDevice):
         if self.state != STATE_OFF:
             if self._tizenws:
                 if not self._tizenws.active:
-                    self._tizenws.open(self.hass.loop)
-                await self._tizenws.get_running_app()
+                    self._tizenws.open()
             if self._upnp:
                 await self._update_volume_info()
         else:
@@ -309,7 +319,7 @@ class SmartThingsTV(SmartThingsEntity, MediaPlayerDevice):
         """List of available input sources."""
         installed_apps = (
             [app.app_name for app in self._tizenws.installed_apps.values()]
-            if self._tizenws
+            if self._tizenws and self._tizenws.installed_apps
             else []
         )
         return (
@@ -346,6 +356,10 @@ class SmartThingsTV(SmartThingsEntity, MediaPlayerDevice):
         """Name of the channel currently playing."""
         channel_name = self._device.status.attributes["tvChannelName"].value
         return channel_name if channel_name and not self.app_id else None
+
+    @property
+    def device_state_attributes(self):
+        return self._device.status.attributes
 
     @property
     def app_id(self):
@@ -424,9 +438,10 @@ class SmartThingsTV(SmartThingsEntity, MediaPlayerDevice):
 
     async def async_select_source(self, source):
         """Select input source."""
-        for app in self.installed_apps:
+        for app in self._tizenws.installed_apps.values():
             if app.app_name == source:
                 await self._tizenws.run_app(app.app_id)
+                return
         else:
             await self._device.command(
                 "main", Capability.media_input_source, "setInputSource", [source]
