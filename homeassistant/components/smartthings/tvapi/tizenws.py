@@ -52,8 +52,9 @@ def _noop(*args, **kwargs):
     pass
 
 
-class MemoryDataStore(object):
-    def __init__(self):
+class FileDataStore(object):
+    def __init__(self, name):
+        self._name = name
         self._data = {}
 
     async def get(self, key, default=None):
@@ -71,7 +72,7 @@ class MemoryDataStore(object):
 
     async def _load_from_store(self):
         try:
-            async with aiofiles.open('token.txt', mode='r') as f:
+            async with aiofiles.open(f"{self._name}.token", mode="r") as f:
                 data = await f.read()
                 return json.loads(data)
         except Exception as exc:
@@ -80,7 +81,7 @@ class MemoryDataStore(object):
 
     async def _save_to_store(self, data):
         try:
-            async with aiofiles.open('token.txt', mode='w') as f:
+            async with aiofiles.open(f"{self._name}.token", mode="w") as f:
                 await f.write(json.dumps(data))
         except Exception as exc:
             _LOGGER.error(f"Failed to write storage file: {exc}")
@@ -98,37 +99,41 @@ class TizenWebsocket:
         self,
         name,
         host,
-        create_task,
         data_store=None,
+        loop=None,
         session=None,
         update_callback=None,
-        token=None,
     ):
         """Initialize a TizenWebsocket instance."""
         self.host = host
         self.name = name
         self.session = session or aiohttp.ClientSession()
+        self._managed_session = not session
         self.key_press_delay = 0
         self.current_app = None
         self.installed_apps = {}
-        self._store = data_store or MemoryDataStore()
+        self._store = data_store or FileDataStore(self.name)
         self._update = update_callback or _noop
         self._found_running_app = False
         self._ws_remote = None
         self._ws_control = None
-        self._create_task = create_task
+        self._loop = loop or asyncio.get_running_loop()
         self._connected = False
         self._remote_task = None
         self._control_task = None
         self._app_monitor_task = None
+        self._is_connecting = False
 
     @property
     def connected(self):
         return self._connected
 
     def open(self, ):
-        _LOGGER.debug("Open websocket connections")
-        self._remote_task = self._create_task(self._open_connection(WS_REMOTE))
+        if self.connected or self._is_connecting:
+            _LOGGER.debug("Already connected")
+        else:
+            _LOGGER.debug("Open websocket connections")
+            self._remote_task = self._loop.create_task(self._open_connection(WS_REMOTE))
 
     def close(self):
         """Close the listening websocket."""
@@ -139,6 +144,9 @@ class TizenWebsocket:
             self._control_task.cancel()
         if self._app_monitor_task:
             self._app_monitor_task.cancel()
+        if self._managed_session:
+            _LOGGER.debug("Closing managed ClientSession")
+            self._loop.create_task(self.session.close())
 
     async def _open_connection(self, conn_name):
         """Open a persistent websocket connection and act on events."""
@@ -147,6 +155,8 @@ class TizenWebsocket:
         url = format_websocket_url(self.host, path, self.name, token)
         _LOGGER.debug(f"{conn_name}: Attempting connection to {url}")
         try:
+            self._connected = False
+            self._is_connecting = True
             async with self.session.ws_connect(url, ssl=False) as ws:
                 setattr(self, f"_ws_{conn_name}", ws)
                 _LOGGER.debug(f"{conn_name}: Connection established")
@@ -170,6 +180,9 @@ class TizenWebsocket:
             _LOGGER.debug(f"{conn_name}: disconnected")
             setattr(self, f"_ws_{conn_name}", None)
             self._connected = False
+            self._is_connecting = False
+            self.current_app = None
+            self.installed_apps = {}
 
     async def _handle_message(self, conn_name, msg):
         if msg.type == aiohttp.WSMsgType.TEXT:
@@ -194,11 +207,12 @@ class TizenWebsocket:
             _LOGGER.debug(f"Got token: {token}")
             await self._store.set(ATTR_TOKEN, token)
         await self.request_installed_apps()
-        self._control_task = self._create_task(self._open_connection(WS_CONTROL))
+        self._control_task = self._loop.create_task(self._open_connection(WS_CONTROL))
 
     async def _on_connect_control(self, msg):
-        self._app_monitor_task = self._create_task(self._monitor_running_app())
+        self._app_monitor_task = self._loop.create_task(self._monitor_running_app())
         self._connected = True
+        self._is_connecting = False
 
     async def _on_message_remote(self, msg):
         event = msg.get("event")
@@ -337,3 +351,132 @@ class TizenWebsocket:
                 )
         except Exception:
             _LOGGER.error(f"Failed to run app {app_id}", exc_info=True)
+
+
+if __name__ == "__main__":
+    import sys
+    from asynccmd import Cmd
+
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+    formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setLevel(logging.DEBUG)
+    handler.setFormatter(formatter)
+    root.addHandler(handler)
+
+    class SimpleCommander(Cmd):
+        def __init__(self, mode, intro, prompt):
+            # We need to pass in Cmd class mode of async cmd running
+            super().__init__(mode=mode)
+            self.intro = intro
+            self.prompt = prompt
+            self.loop = None
+            self.tizenws = None
+
+        def do_tasks(self, arg):
+            for task in asyncio.Task.all_tasks(loop=self.loop):
+                print(task)
+
+        def do_loglevel(self, arg):
+            if not arg:
+                print("You must provide a loglevel to set")
+            elif arg == "debug":
+                root.setLevel(logging.DEBUG)
+                handler.setLevel(logging.DEBUG)
+            elif arg == "info":
+                root.setLevel(logging.INFO)
+                handler.setLevel(logging.INFO)
+            elif arg == "warn":
+                root.setLevel(logging.WARNING)
+                handler.setLevel(logging.WARNING)
+            elif arg == "error":
+                root.setLevel(logging.ERROR)
+                handler.setLevel(logging.ERROR)
+            else:
+                print("Invalid loglevel. Available: debug, info, warn, error")
+                return
+            print(f"Loglevel is now {arg}")
+
+        def do_connect(self, arg):
+            if self.tizenws:
+                print("Already connected")
+                return
+
+            args = arg.split(" ")
+            if not args[0]:
+                print("Error no host given")
+                return
+            if len(args) < 2 or not args[1]:
+                args[1] = "TizenWS Commandline"
+            self.tizenws = TizenWebsocket(args[1], args[0], loop=self.loop)
+            self.tizenws.open()
+
+        def do_disconnect(self, arg):
+            if not self.tizenws:
+                print("Not connected")
+                return
+            self.tizenws.close()
+            self.tizenws = None
+
+        def do_status(self, arg):
+            is_connecting = self.tizenws._is_connecting if self.tizenws else False
+            connected = self.tizenws.connected if self.tizenws else False
+            print(f"Initializing connection: {is_connecting}")
+            print(f"Connected: {connected}")
+
+        def do_app(self, arg):
+            if not self.tizenws or not self.tizenws.connected:
+                print("Not connected")
+                return
+
+            args = arg.split(" ")
+            if not args[0]:
+                print(self.tizenws.current_app)
+            elif args[0] == "list":
+                if self.tizenws and self.tizenws.installed_apps:
+                    for app in self.tizenws.installed_apps.values():
+                        print(f"{app.app_name}: {app.app_id}")
+            elif args[0] == "fetch":
+                self.loop.create_task(self.tizenws.request_installed_apps())
+            elif args[0] == "run":
+                if len(args) < 2:
+                    print("You must provide an App ID to run")
+                else:
+                    self.loop.create_task(self.tizenws.run_app(args[1]))
+            else:
+                print(f"Invalid app command {args[0]}")
+
+        def do_key(self, arg):
+            if not self.tizenws or not self.tizenws.connected:
+                print("Not connected")
+            elif not arg:
+                print("You must provide a key to send")
+            else:
+                self.loop.create_task(self.tizenws.send_key(arg))
+
+        def do_exit(self, arg):
+            if self.tizenws:
+                self.tizenws.close()
+            self.loop.stop()
+
+        def start(self, loop=None):
+            # We pass our loop to Cmd class.
+            # If None it try to get default asyncio loop.
+            self.loop = loop
+            # Create async tasks to run in loop. There is run_loop=false by default
+            super().cmdloop(loop)
+
+    if sys.platform == "win32":
+        loop = asyncio.ProactorEventLoop()
+        mode = "Run"
+    else:
+        loop = asyncio.get_event_loop()
+        mode = "Reader"
+    # create instance
+    cmd = SimpleCommander(mode=mode, intro="TizenWS Commandline", prompt="tizenws> ")
+    cmd.start(loop)  # prepare instance
+    try:
+        loop.run_forever()  # our cmd will run automatically from this moment
+    except KeyboardInterrupt:
+        loop.stop()

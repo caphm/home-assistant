@@ -37,7 +37,7 @@ from homeassistant.const import (
 from . import SmartThingsEntity
 from .const import DATA_BROKERS, DOMAIN, STORAGE_VERSION
 from .tvapi.upnp import upnp
-from .tvapi.tizenws import TizenWebsocket, MemoryDataStore
+from .tvapi.tizenws import TizenWebsocket, FileDataStore
 
 import voluptuous as vol
 from homeassistant.util import slugify
@@ -171,16 +171,15 @@ def get_capabilities(capabilities: Sequence[str]) -> Optional[Sequence[str]]:
         return supported
 
 
-class PersistentDataStore(MemoryDataStore):
-    def __init__(self, hass, id):
-        super().__init__()
+class HassDataStore(FileDataStore):
+    def __init__(self, hass, name):
+        super().__init__(name)
         self.hass = hass
-        self.id = id
 
     async def _load_from_store(self):
         """Load the retained data from store and return de-serialized data."""
         store = Store(
-            self.hass, STORAGE_VERSION, f"smartthings.{self.id}", encoder=JSONEncoder
+            self.hass, STORAGE_VERSION, f"smartthings.{self._name}", encoder=JSONEncoder
         )
         restored = await store.async_load()
         if restored is None:
@@ -190,7 +189,7 @@ class PersistentDataStore(MemoryDataStore):
     async def _save_to_store(self, data):
         """Generate dynamic data to store and save it to the filesystem."""
         store = Store(
-            self.hass, STORAGE_VERSION, f"smartthings.{self.id}", encoder=JSONEncoder
+            self.hass, STORAGE_VERSION, f"smartthings.{self._name}", encoder=JSONEncoder
         )
         await store.async_save(data)
 
@@ -239,8 +238,9 @@ class SmartThingsTV(SmartThingsEntity, MediaPlayerDevice):
             self._tizenws = TizenWebsocket(
                 name=f"{WS_PREFIX} {self.name}",
                 host=self._host,
-                create_task=self.hass.async_create_task,
-                data_store=PersistentDataStore(self.hass, self.unique_id),
+                loop=self.hass.loop,
+                session=self.hass.helpers.aiohttp_client.async_get_clientsession(),
+                data_store=HassDataStore(self.hass, self.unique_id),
                 update_callback=self.async_schedule_update_ha_state,
             )
 
@@ -495,8 +495,8 @@ class SmartThingsTV(SmartThingsEntity, MediaPlayerDevice):
             await self._upnp.async_set_current_media(media_id)
         elif media_type == "application/vnd.apple.mpegurl":
             await self._upnp.async_set_current_media(media_id)
-        elif media_type == MEDIA_TYPE_BROWSER:
-            self._tizenws.open_browser(media_id)
+        # elif media_type == MEDIA_TYPE_BROWSER:
+        #     self._tizenws.open_browser(media_id)
         else:
             _LOGGER.error("Unsupported media type")
             return
