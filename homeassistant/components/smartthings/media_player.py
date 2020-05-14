@@ -208,12 +208,6 @@ class SmartThingsTV(SmartThingsEntity, MediaPlayerDevice):
         self._app_name = None
         self._app_id = None
 
-        def close_tizenws():                                                
-            if self._tizenws and self._tizenws.active:                      
-                self._tizenws.close()
-
-        # self.hass.bus.async_listen(EVENT_HOMEASSISTANT_STOP, close_tizenws)
-
     def _get_ip_addr(self):
         ipaddr = self.hass.states.get(
             "input_text.{}_ipaddr".format(slugify(self.unique_id))
@@ -230,6 +224,13 @@ class SmartThingsTV(SmartThingsEntity, MediaPlayerDevice):
         """Device added to hass."""
         await super().async_added_to_hass()
 
+        def close_tizenws(event):
+            if self._tizenws:
+                _LOGGER.debug("Home Assistant ist stopping, shutting down TizenWebsocket")
+                self._tizenws.close()
+
+        self.event_unsub = self.hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, close_tizenws)
+
         if self._get_ip_addr():
             self._upnp = upnp(
                 self._host, self.hass.helpers.aiohttp_client.async_get_clientsession()
@@ -242,12 +243,13 @@ class SmartThingsTV(SmartThingsEntity, MediaPlayerDevice):
                 data_store=PersistentDataStore(self.hass, self.unique_id),
                 update_callback=self.async_schedule_update_ha_state,
             )
-        self.async_schedule_update_ha_state(True)
 
     async def async_will_remove_from_hass(self):
         await super().async_will_remove_from_hass()
-        if self._tizenws and self._tizenws.active:
+        if self._tizenws:
+            _LOGGER.debug("Entity is being removed from Home Assistant, shutting down TizenWebsocket")
             self._tizenws.close()
+        self.event_unsub()
 
     async def _update_volume_info(self):
         if self.state != STATE_OFF:
@@ -259,14 +261,15 @@ class SmartThingsTV(SmartThingsEntity, MediaPlayerDevice):
         await self._device.status.refresh()
         if self.state != STATE_OFF:
             if self._tizenws:
-                if not self._tizenws.active:
+                if not self._tizenws.connected:
                     self._tizenws.open()
+                    _LOGGER.debug("Opened TizenWebsocket connection")
             if self._upnp:
                 await self._update_volume_info()
         else:
             self._app_id = None
             self._app_name = None
-            if self._tizenws and self._tizenws.active:
+            if self._tizenws and self._tizenws.connected:
                 self._tizenws.close()
 
     @property

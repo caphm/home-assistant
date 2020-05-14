@@ -107,7 +107,6 @@ class TizenWebsocket:
         """Initialize a TizenWebsocket instance."""
         self.host = host
         self.name = name
-        self.active = False
         self.session = session or aiohttp.ClientSession()
         self.key_press_delay = 0
         self.current_app = None
@@ -118,21 +117,27 @@ class TizenWebsocket:
         self._ws_remote = None
         self._ws_control = None
         self._create_task = create_task
+        self._connected = False
+        self._remote_task = None
+        self._control_task = None
+        self._app_monitor_task = None
+
+    @property
+    def connected(self):
+        return self._connected
 
     def open(self, ):
         _LOGGER.debug("Open websocket connections")
-        self.active = True
         self._remote_task = self._create_task(self._open_connection(WS_REMOTE))
 
     def close(self):
         """Close the listening websocket."""
         _LOGGER.debug("Closing websocket connections")
-        self.active = False
-        if self._ws_remote and not self._ws_remote.closed:
-            self._create_task(self._ws_remote.close())
-        if self._ws_control and not self._ws_control.closed:
-            self._create_task(self._ws_control.close())
-        if self._app_monitor_task is not None:
+        if self._remote_task:
+            self._remote_task.cancel()
+        if self._control_task:
+            self._control_task.cancel()
+        if self._app_monitor_task:
             self._app_monitor_task.cancel()
 
     async def _open_connection(self, conn_name):
@@ -164,6 +169,7 @@ class TizenWebsocket:
         finally:
             _LOGGER.debug(f"{conn_name}: disconnected")
             setattr(self, f"_ws_{conn_name}", None)
+            self._connected = False
 
     async def _handle_message(self, conn_name, msg):
         if msg.type == aiohttp.WSMsgType.TEXT:
@@ -192,12 +198,13 @@ class TizenWebsocket:
 
     async def _on_connect_control(self, msg):
         self._app_monitor_task = self._create_task(self._monitor_running_app())
+        self._connected = True
 
     async def _on_message_remote(self, msg):
         event = msg.get("event")
 
         if event == "ed.installedApp.get":
-            await self._handle_installed_apps(msg)
+            self._build_app_list(msg)
         elif event == "ed.edenTV.update":
             # self.get_running_app(force_scan=True)
             pass
@@ -220,10 +227,10 @@ class TizenWebsocket:
         new_current_app = self.installed_apps.get(app_id) if app_id else None
         if new_current_app != self.current_app:
             self.current_app = new_current_app
-            _LOGGER.info(f"Running app is: {self.current_app}")
+            _LOGGER.debug(f"Running app is: {self.current_app}")
             self._update()
 
-    async def _handle_installed_apps(self, response):
+    def _build_app_list(self, response):
         list_app = response.get("data", {}).get("data")
         installed_apps = {}
         for app_info in list_app:
@@ -249,7 +256,7 @@ class TizenWebsocket:
             _LOGGER.error("Failed to request installed apps", exc_info=True)
 
     async def _monitor_running_app(self):
-        _LOGGER.debug("Running app monitor: starting")
+        _LOGGER.debug("App monitor: starting")
         while self._ws_control and not self._ws_control.closed:
             self._found_running_app = False
             for app in self.installed_apps.values():
@@ -270,7 +277,7 @@ class TizenWebsocket:
                 except Exception as exc:
                     _LOGGER.error(f"Error while querying app status: {exc}", exc_info=True)
                 else:
-                    await asyncio.sleep(0.15)
+                    await asyncio.sleep(0.1)
             if self.current_app and not self._found_running_app:
                 self._update_current_app(None)
         _LOGGER.debug("App monitor: stopping")
@@ -289,7 +296,7 @@ class TizenWebsocket:
                     },
                 }
             )
-        except:
+        except Exception:
             _LOGGER.error(f"Failed to send key {key}", exc_info=True)
         else:
             if key_press_delay is None:
