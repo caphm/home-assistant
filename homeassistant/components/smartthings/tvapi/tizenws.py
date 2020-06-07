@@ -23,7 +23,7 @@ App = namedtuple("App", ["app_id", "app_name", "app_type"])
 
 def serialize_string(string):
     if isinstance(string, str):
-        string = str.encode(string)
+        string = str.encode(string, "utf-8")
 
     return base64.b64encode(string).decode("utf-8")
 
@@ -40,12 +40,6 @@ def format_websocket_url(host, path, name, token=None):
     if token:
         return str(url.update_query({"token": token}))
     return str(url)
-
-
-async def retry_delay(num_errors):
-    retry_delay = min(2 ** (num_errors - 1) * 5, 300)
-    _LOGGER.debug(f"Retrying in {retry_delay}s")
-    await asyncio.sleep(retry_delay)
 
 
 def _noop(*args, **kwargs):
@@ -99,6 +93,7 @@ class TizenWebsocket:
         self,
         name,
         host,
+        key_press_delay=0,
         data_store=None,
         loop=None,
         session=None,
@@ -107,32 +102,47 @@ class TizenWebsocket:
         """Initialize a TizenWebsocket instance."""
         self.host = host
         self.name = name
+        self.key_press_delay = key_press_delay
         self.session = session or aiohttp.ClientSession()
         self._managed_session = not session
-        self.key_press_delay = 0
-        self.current_app = None
-        self.installed_apps = {}
         self._store = data_store or FileDataStore(self.name)
-        self._update = update_callback or _noop
+        self._loop = loop or asyncio.get_running_loop()
+        self._current_app = None
+        self._installed_apps = {}
+        self._signal_update = update_callback or _noop
         self._found_running_app = False
         self._ws_remote = None
         self._ws_control = None
-        self._loop = loop or asyncio.get_running_loop()
         self._connected = False
+        self._is_connecting = False
         self._remote_task = None
         self._control_task = None
         self._app_monitor_task = None
-        self._is_connecting = False
 
     @property
     def connected(self):
         return self._connected
 
+    @property
+    def current_app(self):
+        return self._current_app
+
+    @property
+    def installed_apps(self):
+        return self._installed_apps
+
+    @property
+    def is_connecting(self):
+        return self._is_connecting
+
     def open(self, ):
         if self.connected or self._is_connecting:
-            _LOGGER.debug("Already connected")
+            _LOGGER.warn("Already connected")
         else:
-            _LOGGER.debug("Open websocket connections")
+            if self._managed_session and (self.session is None or self.session.closed):
+                self.session = aiohttp.ClientSession()
+                _LOGGER.debug("Created new managed ClientSession")
+            _LOGGER.debug("Opening websocket connections")
             self._remote_task = self._loop.create_task(self._open_connection(WS_REMOTE))
 
     def close(self):
@@ -181,8 +191,8 @@ class TizenWebsocket:
             setattr(self, f"_ws_{conn_name}", None)
             self._connected = False
             self._is_connecting = False
-            self.current_app = None
-            self.installed_apps = {}
+            self._current_app = None
+            self._installed_apps = {}
 
     async def _handle_message(self, conn_name, msg):
         if msg.type == aiohttp.WSMsgType.TEXT:
@@ -210,18 +220,13 @@ class TizenWebsocket:
         self._control_task = self._loop.create_task(self._open_connection(WS_CONTROL))
 
     async def _on_connect_control(self, msg):
-        self._app_monitor_task = self._loop.create_task(self._monitor_running_app())
         self._connected = True
         self._is_connecting = False
+        self._app_monitor_task = self._loop.create_task(self._monitor_running_app())
 
     async def _on_message_remote(self, msg):
-        event = msg.get("event")
-
-        if event == "ed.installedApp.get":
+        if msg.get("event") == "ed.installedApp.get":
             self._build_app_list(msg)
-        elif event == "ed.edenTV.update":
-            # self.get_running_app(force_scan=True)
-            pass
 
     async def _on_message_control(self, msg):
         app_id = None
@@ -238,24 +243,25 @@ class TizenWebsocket:
             self._update_current_app(app_id)
 
     def _update_current_app(self, app_id):
-        new_current_app = self.installed_apps.get(app_id) if app_id else None
-        if new_current_app != self.current_app:
-            self.current_app = new_current_app
-            _LOGGER.debug(f"Running app is: {self.current_app}")
-            self._update()
+        new_current_app = self._installed_apps.get(app_id) if app_id else None
+        if new_current_app != self._current_app:
+            self._current_app = new_current_app
+            _LOGGER.debug(f"Running app is: {self._current_app}")
+            self._signal_update()
 
     def _build_app_list(self, response):
         list_app = response.get("data", {}).get("data")
         installed_apps = {}
         for app_info in list_app:
+            # Waipu contains unreadable characters in the name, so we skip it
             if "waipu" in app_info["name"]:
                 continue
             app_id = app_info["appId"]
             app = App(app_id, app_info["name"], app_info["app_type"])
             installed_apps[app_id] = app
-        self.installed_apps = installed_apps
+        self._installed_apps = installed_apps
         _LOGGER.debug("Installed apps:\n\t{}".format("\n\t".join([f"{app.app_name}: {app.app_id}" for app in installed_apps.values()])))
-        self._update()
+        self._signal_update()
 
     async def request_installed_apps(self):
         _LOGGER.debug("Requesting list of installed apps")
@@ -273,7 +279,7 @@ class TizenWebsocket:
         _LOGGER.debug("App monitor: starting")
         while self._ws_control and not self._ws_control.closed:
             self._found_running_app = False
-            for app in self.installed_apps.values():
+            for app in self._installed_apps.values():
                 if not self._ws_control or self._ws_control.closed:
                     break
                 try:
@@ -292,7 +298,7 @@ class TizenWebsocket:
                     _LOGGER.error(f"Error while querying app status: {exc}", exc_info=True)
                 else:
                     await asyncio.sleep(0.1)
-            if self.current_app and not self._found_running_app:
+            if self._current_app and not self._found_running_app:
                 self._update_current_app(None)
         _LOGGER.debug("App monitor: stopping")
 
@@ -320,7 +326,7 @@ class TizenWebsocket:
 
     async def run_app(self, app_id, action_type="", meta_tag=""):
         if not action_type:
-            app = self.installed_apps.get(app_id)
+            app = self._installed_apps.get(app_id)
             action_type = "NATIVE_LAUNCH" if app and app.app_type != 2 else "DEEP_LINK"
 
         _LOGGER.debug(f"Running app {app_id} / {action_type} / {meta_tag}")
