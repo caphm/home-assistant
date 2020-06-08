@@ -5,7 +5,7 @@ from typing import Optional, Sequence
 
 from pysmartthings import Attribute, Capability
 
-from homeassistant.components.media_player import MediaPlayerDevice
+from homeassistant.components.media_player import MediaPlayerEntity
 from homeassistant.components.media_player.const import (
     SUPPORT_NEXT_TRACK,
     SUPPORT_PAUSE,
@@ -194,7 +194,7 @@ class HassDataStore(FileDataStore):
         await store.async_save(data)
 
 
-class SmartThingsTV(SmartThingsEntity, MediaPlayerDevice):
+class SmartThingsTV(SmartThingsEntity, MediaPlayerEntity):
     """Define a SmartThings TV."""
 
     def __init__(self, device):
