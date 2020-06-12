@@ -389,24 +389,19 @@ class Profiles:
     @classmethod
     def _build_profile_from_entity(cls, entity_id, xy_color_attribute, brightness_modifier):
         entity_state = cls._hass.states.get(entity_id)
-        if entity_state:
-            _LOGGER.debug(f"Building on-the-fly profile from {entity_state}")
+        if entity_state is not None:
+            _LOGGER.debug(f"Building on-the-fly profile from {entity_state} ({xy_color_attribute}, {brightness_modifier})")
 
-            xy_color = (None, None)
-            if xy_color_attribute is not None:
-                if xy_color_attribute in entity_state.attributes:
-                    xy_color = entity_state.attributes[xy_color_attribute]
-                else:
-                    _LOGGER.error(f"{entity_id} does not have an attribute named {xy_color_attribute}")
+            xy_color_from_entity = entity_state.attributes.get(xy_color_attribute)
+            xy_color = xy_color_from_entity if xy_color_from_entity else (None, None)
 
-            brightness = None
+            brightness_from_entity = entity_state.attributes.get(ATTR_BRIGHTNESS)
             if brightness_modifier == PROFILE_FULL_BRIGHTNESS:
                 brightness = 255
-            elif brightness_modifier is not None:
-                if ATTR_BRIGHTNESS in entity_state.attributes:
-                    brightness = min(255, math.ceil(entity_state.attributes[ATTR_BRIGHTNESS] * brightness_modifier / 100))
-                else:
-                    _LOGGER.error(f"{entity_id} does not have an attribute named brightness")
+            elif brightness_from_entity:
+                brightness = min(255, math.ceil(brightness_from_entity * brightness_modifier / 100))
+            else:
+                brightness = None
 
             profile = (xy_color[0], xy_color[1], brightness)
             _LOGGER.debug(f"Built on-the-fly profile: {profile}")
