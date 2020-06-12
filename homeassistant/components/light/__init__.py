@@ -3,6 +3,7 @@ import csv
 from datetime import timedelta
 import logging
 import os
+import math
 from typing import Dict, Optional, Tuple
 
 import voluptuous as vol
@@ -131,6 +132,24 @@ PROFILE_SCHEMA = vol.Schema(
     )
 )
 
+PROFILE_FULL_BRIGHTNESS = "max"
+
+PROFILE_SCHEMA_ENTITY = vol.Schema(
+    vol.ExactSequence(
+        (
+            str,  # profile name
+            str,  # entity_id to get the values from
+            vol.Maybe(str),  # attribute of entity that stores xy_color, not included in profile if None
+            vol.Maybe(  # brightness, not included in profile if None
+                vol.Any(
+                    PROFILE_FULL_BRIGHTNESS,  # always set to max brightness
+                    vol.All(vol.Coerce(float), vol.Clamp(min=0.001)),  # attenuate brightness value of entity by given percent
+                )
+            )
+        )
+    )
+)
+
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -144,8 +163,12 @@ def preprocess_turn_on_alternatives(params):
     """Process extra data for turn light on request."""
     profile = Profiles.get(params.pop(ATTR_PROFILE, None))
     if profile is not None:
-        params.setdefault(ATTR_XY_COLOR, profile[:2])
-        params.setdefault(ATTR_BRIGHTNESS, profile[2])
+        _LOGGER.debug(f"Turning on light with profile {profile}")
+        profile_xy_color = profile[:2]
+        if profile_xy_color[0] is not None and profile_xy_color[1] is not None:
+            params.setdefault(ATTR_XY_COLOR, profile_xy_color)
+        if profile[2] is not None:
+            params.setdefault(ATTR_BRIGHTNESS, profile[2])
         if len(profile) > 3:
             params.setdefault(ATTR_TRANSITION, profile[3])
 
@@ -292,10 +315,15 @@ async def async_unload_entry(hass, entry):
     return await hass.data[DOMAIN].async_unload_entry(entry)
 
 
+def _is_entity_profile(profile):
+    return profile is not None and type(profile[0]) is str
+
+
 class Profiles:
     """Representation of available color profiles."""
 
-    _all: Optional[Dict[str, Tuple[float, float, int]]] = None
+    _all = None
+    _hass = None
 
     @classmethod
     async def load_profiles(cls, hass):
@@ -318,8 +346,8 @@ class Profiles:
                     # Skip the header
                     next(reader, None)
 
-                    try:
-                        for rec in reader:
+                    for rec in reader:
+                        try:
                             (
                                 profile,
                                 color_x,
@@ -336,20 +364,56 @@ class Profiles:
                                 brightness,
                                 transition,
                             )
-                    except vol.MultipleInvalid as ex:
-                        _LOGGER.error(
-                            "Error parsing light profile from %s: %s", profile_path, ex
-                        )
-                        return None
+                        except vol.MultipleInvalid as ex1:
+                            try:
+                                profile, sensor, color_attribute, brightness_modifier = PROFILE_SCHEMA_ENTITY(rec)
+                                profiles[profile] = (sensor, color_attribute, brightness_modifier)
+                            except vol.MultipleInvalid as ex2:
+                                _LOGGER.error(
+                                    "Error parsing light profile %s from %s: %s - %s", rec[0], profile_path, ex1, ex2
+                                )
             return profiles
 
         cls._all = await hass.async_add_job(load_profile_data, hass)
+        cls._hass = hass
         return cls._all is not None
 
     @classmethod
     def get(cls, name):
         """Return a named profile."""
-        return cls._all.get(name)
+        profile = cls._all.get(name)
+        if _is_entity_profile(profile):
+            return cls._build_profile_from_entity(*profile)
+        return profile
+
+    @classmethod
+    def _build_profile_from_entity(cls, entity_id, xy_color_attribute, brightness_modifier):
+        entity_state = cls._hass.states.get(entity_id)
+        if entity_state:
+            _LOGGER.debug(f"Building on-the-fly profile from {entity_state}")
+
+            xy_color = (None, None)
+            if xy_color_attribute is not None:
+                if xy_color_attribute in entity_state.attributes:
+                    xy_color = entity_state.attributes[xy_color_attribute]
+                else:
+                    _LOGGER.error(f"{entity_id} does not have an attribute named {xy_color_attribute}")
+
+            brightness = None
+            if brightness_modifier == PROFILE_FULL_BRIGHTNESS:
+                brightness = 255
+            elif brightness_modifier is not None:
+                if ATTR_BRIGHTNESS in entity_state.attributes:
+                    brightness = min(255, math.ceil(entity_state.attributes[ATTR_BRIGHTNESS] * brightness_modifier / 100))
+                else:
+                    _LOGGER.error(f"{entity_id} does not have an attribute named brightness")
+
+            profile = (xy_color[0], xy_color[1], brightness)
+            _LOGGER.debug(f"Built on-the-fly profile: {profile}")
+            return profile
+        else:
+            _LOGGER.error(f"Cannot build profile from entity, {entity_id} does not exist")
+            return None
 
     @classmethod
     def get_default(cls, entity_id):
